@@ -1,13 +1,23 @@
 {
-  "name": "worker",
+  "name": "calendar-shift-worker",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Oura webhook worker for calendar shifting",
+  "main": "src/index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
-  "keywords": [],
+  "keywords": [
+    "oura",
+    "calendar",
+    "cloudflare-workers"
+  ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "devDependencies": {
+    "@vitest/coverage-v8": "^3.2.4",
+    "vitest": "^3.2.4"
+  }
 }

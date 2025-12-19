@@ -6,7 +6,10 @@
  */
 
 // Sleep event names to identify wake time events
-const SLEEP_EVENT_NAMES = ['sleep', 'wake', 'wakeup', 'wake up', 'bedtime'];
+export const SLEEP_EVENT_NAMES = ['sleep', 'wake', 'wakeup', 'wake up', 'bedtime'];
+
+// Prayer times - these are fixed based on sun position and should never shift
+export const PRAYER_EVENT_NAMES = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha', 'prayer', 'salah', 'salat'];
 
 export default {
   async fetch(request, env, ctx) {
@@ -43,7 +46,7 @@ export default {
 /**
  * Handle Oura webhook verification challenge
  */
-function handleVerification(request, env) {
+export function handleVerification(request, env) {
   const url = new URL(request.url);
   const challenge = url.searchParams.get('challenge');
 
@@ -58,7 +61,7 @@ function handleVerification(request, env) {
 /**
  * Handle incoming webhook notification
  */
-async function handleWebhook(request, env, ctx) {
+export async function handleWebhook(request, env, ctx) {
   try {
     const data = await request.json();
     console.log('Webhook received:', JSON.stringify(data));
@@ -147,6 +150,13 @@ async function processCalendarShift(env) {
         continue;
       }
 
+      // Skip prayer times (fixed based on sun position)
+      if (PRAYER_EVENT_NAMES.some(name => summary.toLowerCase().includes(name))) {
+        console.log(`SKIP (prayer time): ${summary}`);
+        skipped++;
+        continue;
+      }
+
       // Skip all-day events
       if (event.start?.date) {
         console.log(`SKIP (all-day): ${summary}`);
@@ -186,10 +196,12 @@ async function getOuraWakeTime(env) {
   const today = new Date();
   const threeDaysAgo = new Date(today);
   threeDaysAgo.setDate(today.getDate() - 3);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
 
   const params = new URLSearchParams({
     start_date: threeDaysAgo.toISOString().split('T')[0],
-    end_date: today.toISOString().split('T')[0]
+    end_date: tomorrow.toISOString().split('T')[0] // Oura API end_date is exclusive
   });
 
   const response = await fetch(
@@ -376,7 +388,7 @@ async function getTodaysEvents(accessToken) {
 /**
  * Get expected wake time from Sleep event
  */
-function getExpectedWakeTime(events) {
+export function getExpectedWakeTime(events) {
   for (const event of events) {
     const summary = (event.summary || '').toLowerCase();
     if (SLEEP_EVENT_NAMES.some(name => summary.includes(name))) {
@@ -391,7 +403,7 @@ function getExpectedWakeTime(events) {
 /**
  * Check if event is solo (no other attendees)
  */
-function isSoloEvent(event, myEmail) {
+export function isSoloEvent(event, myEmail) {
   const attendees = event.attendees || [];
   if (attendees.length === 0) return true;
 
@@ -399,6 +411,66 @@ function isSoloEvent(event, myEmail) {
     a.email !== myEmail && !a.self
   );
   return others.length === 0;
+}
+
+/**
+ * Determine if an event should be skipped from shifting
+ * Returns { skip: boolean, reason: string | null }
+ */
+export function shouldSkipEvent(event, myEmail) {
+  const summary = event.summary || 'Untitled';
+  const lowerSummary = summary.toLowerCase();
+
+  // Skip sleep events
+  if (SLEEP_EVENT_NAMES.some(name => lowerSummary.includes(name))) {
+    return { skip: true, reason: 'sleep event' };
+  }
+
+  // Skip prayer times (fixed based on sun position)
+  if (PRAYER_EVENT_NAMES.some(name => lowerSummary.includes(name))) {
+    return { skip: true, reason: 'prayer time' };
+  }
+
+  // Skip all-day events
+  if (event.start?.date) {
+    return { skip: true, reason: 'all-day event' };
+  }
+
+  // Skip events with other attendees
+  if (!isSoloEvent(event, myEmail)) {
+    return { skip: true, reason: 'has attendees' };
+  }
+
+  // Skip events without dateTime (shouldn't happen if not all-day, but safety check)
+  if (!event.start?.dateTime) {
+    return { skip: true, reason: 'no start time' };
+  }
+
+  return { skip: false, reason: null };
+}
+
+/**
+ * Calculate shifted times for an event
+ */
+export function calculateShiftedTimes(event, offsetMinutes) {
+  const startDt = new Date(event.start.dateTime);
+  const endDt = new Date(event.end.dateTime);
+
+  startDt.setMinutes(startDt.getMinutes() + offsetMinutes);
+  endDt.setMinutes(endDt.getMinutes() + offsetMinutes);
+
+  return {
+    start: { ...event.start, dateTime: startDt.toISOString() },
+    end: { ...event.end, dateTime: endDt.toISOString() }
+  };
+}
+
+/**
+ * Calculate offset in minutes between actual and expected wake time
+ */
+export function calculateOffset(actualWake, expectedWake) {
+  const offsetMs = actualWake.getTime() - expectedWake.getTime();
+  return Math.round(offsetMs / 60000);
 }
 
 /**
