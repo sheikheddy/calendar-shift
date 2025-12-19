@@ -1,0 +1,14 @@
+name = "oura-webhook"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+routes = [
+  { pattern = "oura-webhook.abdur-raheem.com/*", zone_name = "abdur-raheem.com" }
+]
+
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "c32faee297324dd9a873dcef3a02a5ea"
+
+[vars]
+VERIFICATION_TOKEN = "calendar-shift-webhook-secret"

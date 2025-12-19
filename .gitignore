@@ -1,0 +1,25 @@
+# Credentials and tokens (sensitive)
+credentials.json
+token.json
+oura_credentials.json
+oura_token.json
+config.txt
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Logs
+*.log
+
+# Node
+node_modules/
+.wrangler/
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
