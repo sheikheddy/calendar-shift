@@ -1,6 +1,8 @@
-# Calendar Shift Tool
+# Calendar Shift
 
-Automatically shifts your personal calendar events when you wake up late. Uses Oura Ring to detect actual wake time, compares to your scheduled "Sleep" event end time, and shifts all solo events by the difference.
+Automatically shifts your personal calendar events when you wake up late. Uses Oura Ring webhooks to detect actual wake time, compares to your scheduled "Sleep" event end time, and shifts all solo events by the difference.
+
+Runs on Cloudflare Workers - no server required.
 
 ## How It Works
 
@@ -16,75 +18,111 @@ Events shifted:
 - 12:00 PM "Lunch" → 2:00 PM ✓
 ```
 
-## Setup
+## Architecture
 
-### 1. Install Dependencies
-
-```bash
-pip install google-auth google-auth-oauthlib google-api-python-client requests
+```
+Oura Ring → syncs → Oura Cloud → webhook → Cloudflare Worker → Google Calendar API
 ```
 
-### 2. Google Calendar API
+1. You sync your Oura Ring (open the app)
+2. Oura sends a webhook to your Cloudflare Worker (~30 sec later)
+3. Worker fetches your wake time from Oura API
+4. Worker compares to "Sleep" event end time in your calendar
+5. Worker shifts all solo events by the difference
+
+## Setup
+
+### 1. Google Calendar API
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create a new project (or use existing)
 3. Enable the **Google Calendar API**
 4. Go to **Credentials** → **Create Credentials** → **OAuth 2.0 Client ID**
 5. Choose **Desktop app**
-6. Download the JSON and save as `credentials.json` in this folder
+6. Download the JSON and save as `credentials.json`
 
-### 3. Oura Ring API
+### 2. Oura API Application
 
-1. Go to [Oura Personal Access Tokens](https://cloud.ouraring.com/personal-access-tokens)
-2. Create a new token
-3. Add it to `config.txt`:
-   ```
-   OURA_TOKEN=your_token_here
-   ```
+1. Go to [Oura API Applications](https://cloud.ouraring.com/oauth/applications)
+2. Create a new application
+3. Note your `client_id` and `client_secret`
 
-### 4. Calendar Setup
-
-Make sure you have a **"Sleep"** event in your calendar that ends at your expected wake time. The script uses this to calculate how late you woke up.
-
-## Usage
+### 3. Deploy Worker
 
 ```bash
-# Auto-detect wake time from Oura and shift events
-python calendar_shift.py
+cd worker
+npm install -g wrangler
+wrangler login
 
-# Preview what would be shifted (no changes)
-python calendar_shift.py --dry-run
+# Create KV namespace for tokens
+wrangler kv namespace create TOKENS
+# Update wrangler.toml with the namespace ID
 
-# Manual offset (in minutes)
-python calendar_shift.py --offset 120
+# Add secrets
+echo "YOUR_GOOGLE_CLIENT_ID" | wrangler secret put GOOGLE_CLIENT_ID
+echo "YOUR_GOOGLE_CLIENT_SECRET" | wrangler secret put GOOGLE_CLIENT_SECRET
+echo "YOUR_OURA_CLIENT_ID" | wrangler secret put OURA_CLIENT_ID
+echo "YOUR_OURA_CLIENT_SECRET" | wrangler secret put OURA_CLIENT_SECRET
 
-# Use a specific calendar
-python calendar_shift.py --calendar "Work"
+# Deploy
+wrangler deploy
 ```
+
+### 4. Configure DNS
+
+Add a route in `wrangler.toml` pointing to your domain, or use a workers.dev subdomain.
+
+### 5. Store OAuth Tokens
+
+Upload your OAuth tokens to KV:
+
+```bash
+wrangler kv key put --namespace-id=YOUR_KV_ID --remote google_token '{"access_token":"...","refresh_token":"...","expiry_date":...}'
+wrangler kv key put --namespace-id=YOUR_KV_ID --remote oura_token '{"access_token":"...","refresh_token":"...","expires_at":...}'
+```
+
+### 6. Create Oura Webhook
+
+```bash
+python setup_webhook.py --url https://your-worker.your-domain.com/webhook/oura
+```
+
+### 7. Calendar Setup
+
+Create a **"Sleep"** event in your calendar that ends at your expected wake time. The worker uses this to calculate how late you woke up.
 
 ## Event Filtering
 
-The script only shifts events that are:
+The worker only shifts events that are:
 - **Solo events** (no other attendees)
 - **Timed events** (not all-day)
 - **Not the Sleep event itself**
 
 Events with other attendees (meetings) are never shifted.
 
-## iOS Automation (Optional)
+## Local Development
 
-To run automatically when you wake up:
+For testing locally:
 
-1. Open **Shortcuts** app on iPhone
-2. Create new **Automation** → **When alarm is stopped**
-3. Add action: **Run Script Over SSH**
-   - Host: your Mac's IP
-   - User: your username
-   - Script: `python3 ~/projects/calendar-shift/calendar_shift.py`
+```bash
+# Run the Python script directly
+python calendar_shift.py --dry-run
 
-Or use the Oura Ring's native wake detection (the script reads from Oura API automatically).
+# Or test the worker locally
+cd worker
+wrangler dev
+```
 
-## Sources
+## Monitoring
 
-- [Oura API Documentation](https://cloud.ouraring.com/v2/docs)
-- [Google Calendar API](https://developers.google.com/calendar/api)
+View worker logs:
+
+```bash
+wrangler tail
+```
+
+Manually trigger a test:
+
+```bash
+curl -X POST https://your-worker.your-domain.com/trigger
+```
