@@ -38,8 +38,9 @@ Oura Ring → syncs → Oura Cloud → webhook → Cloudflare Worker → Google 
 2. Create a new project (or use existing)
 3. Enable the **Google Calendar API**
 4. Go to **Credentials** → **Create Credentials** → **OAuth 2.0 Client ID**
-5. Choose **Desktop app**
-6. Download the JSON and save as `credentials.json`
+5. Choose **Web application** (not Desktop app)
+6. Add authorized redirect URI: `https://your-worker.your-domain.com/auth/google/callback`
+7. Note your Client ID and Client Secret
 
 ### 2. Oura API Application
 
@@ -72,12 +73,19 @@ wrangler deploy
 
 Add a route in `wrangler.toml` pointing to your domain, or use a workers.dev subdomain.
 
-### 5. Store OAuth Tokens
+### 5. Authorize Google Calendar
 
-Upload your OAuth tokens to KV:
+Visit your worker's auth endpoint to connect Google Calendar:
+
+```
+https://your-worker.your-domain.com/auth/google
+```
+
+This will redirect you through Google's OAuth flow and store the tokens automatically.
+
+For Oura, upload the token manually to KV:
 
 ```bash
-wrangler kv key put --namespace-id=YOUR_KV_ID --remote google_token '{"access_token":"...","refresh_token":"...","expiry_date":...}'
 wrangler kv key put --namespace-id=YOUR_KV_ID --remote oura_token '{"access_token":"...","refresh_token":"...","expires_at":...}'
 ```
 
@@ -125,4 +133,16 @@ Manually trigger a test:
 
 ```bash
 curl -X POST https://your-worker.your-domain.com/trigger
+```
+
+Check debug info (wake time, token status, events):
+
+```bash
+curl https://your-worker.your-domain.com/debug
+```
+
+Re-authorize Google Calendar if token expires:
+
+```
+https://your-worker.your-domain.com/auth/google
 ```

@@ -39,9 +39,139 @@ export default {
       return Response.json({ status: 'triggered' });
     }
 
+    // Diagnostic endpoint - shows what would happen without making changes
+    if (url.pathname === '/debug') {
+      return await handleDebug(env);
+    }
+
+    // Google OAuth flow
+    if (url.pathname === '/auth/google') {
+      const redirectUri = `${url.origin}/auth/google/callback`;
+      const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+      authUrl.searchParams.set('client_id', env.GOOGLE_CLIENT_ID);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('scope', 'https://www.googleapis.com/auth/calendar');
+      authUrl.searchParams.set('access_type', 'offline');
+      authUrl.searchParams.set('prompt', 'consent');
+      return Response.redirect(authUrl.toString(), 302);
+    }
+
+    if (url.pathname === '/auth/google/callback') {
+      const code = url.searchParams.get('code');
+      if (!code) {
+        return new Response('Missing code', { status: 400 });
+      }
+
+      const redirectUri = `${url.origin}/auth/google/callback`;
+      const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: env.GOOGLE_CLIENT_ID,
+          client_secret: env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: redirectUri,
+          grant_type: 'authorization_code'
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        return new Response(`Token exchange failed: ${error}`, { status: 500 });
+      }
+
+      const tokens = await response.json();
+      const tokenData = {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expiry_date: Date.now() + (tokens.expires_in * 1000)
+      };
+
+      await env.TOKENS.put('google_token', JSON.stringify(tokenData));
+      return new Response('Google Calendar authorized! You can close this window.', {
+        headers: { 'Content-Type': 'text/html' }
+      });
+    }
+
     return new Response('Not Found', { status: 404 });
   }
 };
+
+/**
+ * Debug endpoint to diagnose calendar shift issues
+ */
+async function handleDebug(env) {
+  const debug = { timestamp: new Date().toISOString() };
+
+  try {
+    // Get Oura wake time
+    const actualWake = await getOuraWakeTime(env);
+    debug.oura = {
+      wakeTime: actualWake ? actualWake.toISOString() : null,
+      error: actualWake ? null : 'Could not get wake time'
+    };
+
+    // Get Google access token
+    const accessToken = await getGoogleAccessToken(env);
+    debug.google = {
+      hasToken: !!accessToken,
+      error: accessToken ? null : 'Could not get access token'
+    };
+
+    if (accessToken) {
+      // Get calendar info for timezone
+      const calendarInfo = await getCalendarInfo(accessToken);
+      const timeZone = calendarInfo.timeZone || 'America/New_York';
+      const myEmail = calendarInfo.id;
+      debug.timeZone = timeZone;
+
+      // Show query params for debugging
+      const { startStr, endStr, localDate } = getDayBoundariesInTimezone(timeZone);
+      debug.query = { timeMin: startStr, timeMax: endStr, localDate };
+
+      // Get today's events - also capture raw response for debugging
+      const eventsResponse = await getTodaysEventsRaw(accessToken, timeZone);
+      debug.rawResponse = eventsResponse.raw;
+      const events = eventsResponse.items;
+      debug.events = {
+        count: events.length,
+        list: events.map(e => ({
+          summary: e.summary || 'Untitled',
+          start: e.start?.dateTime || e.start?.date,
+          end: e.end?.dateTime || e.end?.date
+        }))
+      };
+
+      // Find expected wake time
+      const expectedWake = getExpectedWakeTime(events);
+      debug.expectedWake = expectedWake ? expectedWake.toISOString() : null;
+
+      if (actualWake && expectedWake) {
+        const offsetMinutes = calculateOffset(actualWake, expectedWake);
+        debug.offset = {
+          minutes: offsetMinutes,
+          wouldShift: offsetMinutes > 0
+        };
+        debug.wouldShift = [];
+        debug.wouldSkip = [];
+
+        for (const event of events) {
+          const result = shouldSkipEvent(event, myEmail);
+          if (result.skip) {
+            debug.wouldSkip.push({ summary: event.summary, reason: result.reason });
+          } else {
+            debug.wouldShift.push({ summary: event.summary });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    debug.error = error.message;
+  }
+
+  return Response.json(debug, { headers: { 'Content-Type': 'application/json' } });
+}
 
 /**
  * Handle Oura webhook verification challenge
@@ -110,8 +240,14 @@ async function processCalendarShift(env) {
       return;
     }
 
+    // Get calendar info for timezone
+    const calendarInfo = await getCalendarInfo(accessToken);
+    const timeZone = calendarInfo.timeZone || 'America/New_York';
+    const myEmail = calendarInfo.id;
+    console.log(`Calendar timezone: ${timeZone}`);
+
     // Get today's events
-    const events = await getTodaysEvents(accessToken);
+    const events = await getTodaysEvents(accessToken, timeZone);
     console.log(`Found ${events.length} events today`);
 
     // Find expected wake time from Sleep event
@@ -131,10 +267,6 @@ async function processCalendarShift(env) {
       console.log('Woke up on time or early - no shifting needed');
       return;
     }
-
-    // Get calendar ID for checking attendees
-    const calendarInfo = await getCalendarInfo(accessToken);
-    const myEmail = calendarInfo.id;
 
     // Shift eligible events
     let shifted = 0;
@@ -345,7 +477,9 @@ async function refreshGoogleToken(env, tokenData) {
 }
 
 /**
- * Get calendar info (to get user email)
+ * Get calendar info (email and timezone)
+ * @param {string} accessToken - Google OAuth access token
+ * @returns {Promise<{id: string, timeZone: string, summary: string}>} Calendar metadata
  */
 async function getCalendarInfo(accessToken) {
   const response = await fetch(
@@ -358,21 +492,69 @@ async function getCalendarInfo(accessToken) {
 }
 
 /**
- * Get today's events from Google Calendar
+ * Get start and end of day in a specific timezone
+ * @param {string} timeZone - IANA timezone name (e.g., 'America/New_York')
+ * @returns {{ startStr: string, endStr: string, localDate: string }} Day boundaries
  */
-async function getTodaysEvents(accessToken) {
+function getDayBoundariesInTimezone(timeZone) {
   const now = new Date();
-  const startOfDay = new Date(now);
-  startOfDay.setHours(0, 0, 0, 0);
-  const endOfDay = new Date(startOfDay);
-  endOfDay.setDate(endOfDay.getDate() + 1);
+
+  // Get today's date in the target timezone (YYYY-MM-DD format)
+  const localDate = now.toLocaleDateString('en-CA', { timeZone });
+
+  // Create proper RFC3339 timestamps by parsing local midnight and converting to ISO
+  // This creates a date at midnight local time, then converts to UTC ISO string
+  const startDate = new Date(`${localDate}T00:00:00`);
+  const endDate = new Date(`${localDate}T23:59:59`);
+
+  // Get timezone offset for the target timezone
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: 'numeric',
+    timeZoneName: 'shortOffset'
+  });
+  const parts = formatter.formatToParts(now);
+  const offsetPart = parts.find(p => p.type === 'timeZoneName');
+  // Convert "GMT-5" to "-05:00" format
+  let offset = '+00:00';
+  if (offsetPart) {
+    const match = offsetPart.value.match(/GMT([+-]?)(\d+)?/);
+    if (match) {
+      const sign = match[1] || '+';
+      const hours = match[2] ? match[2].padStart(2, '0') : '00';
+      offset = `${sign}${hours}:00`;
+    }
+  }
+
+  const startStr = `${localDate}T00:00:00${offset}`;
+  const endStr = `${localDate}T23:59:59${offset}`;
+
+  return { startStr, endStr, localDate };
+}
+
+/**
+ * Get today's events from Google Calendar
+ * @param {string} accessToken - Google OAuth access token
+ * @param {string} [timeZone='America/New_York'] - IANA timezone name
+ * @returns {Promise<Array<Object>>} Array of calendar events
+ */
+async function getTodaysEvents(accessToken, timeZone = 'America/New_York') {
+  const result = await getTodaysEventsRaw(accessToken, timeZone);
+  return result.items;
+}
+
+async function getTodaysEventsRaw(accessToken, timeZone = 'America/New_York') {
+  const { startStr, endStr } = getDayBoundariesInTimezone(timeZone);
 
   const params = new URLSearchParams({
-    timeMin: startOfDay.toISOString(),
-    timeMax: endOfDay.toISOString(),
+    timeMin: startStr,
+    timeMax: endStr,
+    timeZone: timeZone,
     singleEvents: 'true',
     orderBy: 'startTime'
   });
+
+  console.log('Fetching events with params:', Object.fromEntries(params));
 
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -382,7 +564,16 @@ async function getTodaysEvents(accessToken) {
   );
 
   const data = await response.json();
-  return data.items || [];
+  console.log('Calendar API response:', JSON.stringify(data).slice(0, 500));
+  return {
+    items: data.items || [],
+    raw: {
+      status: response.status,
+      summary: data.summary,
+      error: data.error,
+      itemCount: data.items?.length
+    }
+  };
 }
 
 /**
