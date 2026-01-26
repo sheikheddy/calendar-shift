@@ -39,9 +39,31 @@ export default {
       return Response.json({ status: 'triggered' });
     }
 
+    // Manual shift (allow negative offset) for recovery
+    if (url.pathname === '/shift' && request.method === 'POST') {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (_) {
+        // ignore parse errors, fall back to query params
+      }
+
+      const offsetParam = body.offset ?? body.offsetMinutes ?? url.searchParams.get('offset');
+      const dateParam = body.date ?? url.searchParams.get('date');
+      const beforeTime = body.before ?? body.beforeTime ?? url.searchParams.get('before');
+
+      const offset = Number(offsetParam);
+      if (!Number.isFinite(offset)) {
+        return Response.json({ error: 'offset (minutes) required' }, { status: 400 });
+      }
+
+      ctx.waitUntil(processCalendarShift(env, offset, dateParam, beforeTime));
+      return Response.json({ status: 'processing', offsetMinutes: offset, date: dateParam || 'today', before: beforeTime });
+    }
+
     // Diagnostic endpoint - shows what would happen without making changes
     if (url.pathname === '/debug') {
-      return await handleDebug(env);
+      return await handleDebug(env, url.searchParams.get('date'));
     }
 
     // Google OAuth flow
@@ -101,12 +123,12 @@ export default {
 /**
  * Debug endpoint to diagnose calendar shift issues
  */
-async function handleDebug(env) {
+async function handleDebug(env, dateParam) {
   const debug = { timestamp: new Date().toISOString() };
 
   try {
     // Get Oura wake time
-    const actualWake = await getOuraWakeTime(env);
+    const actualWake = await getOuraWakeTime(env, dateParam);
     debug.oura = {
       wakeTime: actualWake ? actualWake.toISOString() : null,
       error: actualWake ? null : 'Could not get wake time'
@@ -127,11 +149,11 @@ async function handleDebug(env) {
       debug.timeZone = timeZone;
 
       // Show query params for debugging
-      const { startStr, endStr, localDate } = getDayBoundariesInTimezone(timeZone);
+      const { startStr, endStr, localDate } = getDayBoundariesInTimezone(timeZone, dateParam);
       debug.query = { timeMin: startStr, timeMax: endStr, localDate };
 
       // Get today's events - also capture raw response for debugging
-      const eventsResponse = await getTodaysEventsRaw(accessToken, timeZone);
+      const eventsResponse = await getTodaysEventsRaw(accessToken, timeZone, dateParam);
       debug.rawResponse = eventsResponse.raw;
       const events = eventsResponse.items;
       debug.events = {
@@ -221,17 +243,24 @@ export async function handleWebhook(request, env, ctx) {
 /**
  * Main calendar shift logic
  */
-async function processCalendarShift(env) {
+async function processCalendarShift(env, manualOffsetMinutes = null, dateParam = null, beforeTime = null) {
   try {
     console.log('Starting calendar shift process...');
 
-    // Get Oura wake time
-    const actualWake = await getOuraWakeTime(env);
-    if (!actualWake) {
-      console.log('Could not get wake time from Oura');
-      return;
+    // Determine offset
+    let offsetMinutes = manualOffsetMinutes;
+    let actualWake = null;
+
+    if (offsetMinutes === null) {
+      actualWake = await getOuraWakeTime(env, dateParam);
+      if (!actualWake) {
+        console.log('Could not get wake time from Oura');
+        return;
+      }
+      console.log(`Actual wake time: ${actualWake.toISOString()}`);
+    } else {
+      console.log(`Manual offset provided: ${offsetMinutes} minutes`);
     }
-    console.log(`Actual wake time: ${actualWake.toISOString()}`);
 
     // Get Google Calendar service
     const accessToken = await getGoogleAccessToken(env);
@@ -246,24 +275,25 @@ async function processCalendarShift(env) {
     const myEmail = calendarInfo.id;
     console.log(`Calendar timezone: ${timeZone}`);
 
-    // Get today's events
-    const events = await getTodaysEvents(accessToken, timeZone);
-    console.log(`Found ${events.length} events today`);
+    // Get events for target day
+    const { localDate } = getDayBoundariesInTimezone(timeZone, dateParam);
+    const events = await getTodaysEvents(accessToken, timeZone, dateParam);
+    console.log(`Found ${events.length} events for ${localDate}`);
 
     // Find expected wake time from Sleep event
     const expectedWake = getExpectedWakeTime(events);
-    if (!expectedWake) {
-      console.log('No Sleep event found to determine expected wake time');
-      return;
+    if (offsetMinutes === null) {
+      if (!expectedWake) {
+        console.log('No Sleep event found to determine expected wake time');
+        return;
+      }
+      console.log(`Expected wake time: ${expectedWake.toISOString()}`);
+      offsetMinutes = calculateOffset(actualWake, expectedWake);
     }
-    console.log(`Expected wake time: ${expectedWake.toISOString()}`);
 
-    // Calculate offset
-    const offsetMs = actualWake.getTime() - expectedWake.getTime();
-    const offsetMinutes = Math.round(offsetMs / 60000);
     console.log(`Offset: ${offsetMinutes} minutes`);
 
-    if (offsetMinutes <= 0) {
+    if (offsetMinutes <= 0 && manualOffsetMinutes === null) {
       console.log('Woke up on time or early - no shifting needed');
       return;
     }
@@ -274,6 +304,16 @@ async function processCalendarShift(env) {
 
     for (const event of events) {
       const summary = event.summary || 'Untitled';
+
+      // Optional cutoff: only shift events before a given local time
+      if (beforeTime && event.start?.dateTime) {
+        const localStart = formatTimeInZone(event.start.dateTime, timeZone);
+        if (localStart >= beforeTime) {
+          console.log(`SKIP (after cutoff ${beforeTime}): ${summary}`);
+          skipped++;
+          continue;
+        }
+      }
 
       // Skip sleep events
       if (SLEEP_EVENT_NAMES.some(name => summary.toLowerCase().includes(name))) {
@@ -321,15 +361,15 @@ async function processCalendarShift(env) {
 /**
  * Get wake time from Oura API
  */
-async function getOuraWakeTime(env) {
+async function getOuraWakeTime(env, dateParam = null) {
   const accessToken = await getOuraAccessToken(env);
   if (!accessToken) return null;
 
-  const today = new Date();
-  const threeDaysAgo = new Date(today);
-  threeDaysAgo.setDate(today.getDate() - 3);
-  const tomorrow = new Date(today);
-  tomorrow.setDate(today.getDate() + 1);
+  const targetDate = dateParam ? new Date(`${dateParam}T00:00:00Z`) : new Date();
+  const threeDaysAgo = new Date(targetDate);
+  threeDaysAgo.setDate(targetDate.getDate() - 3);
+  const tomorrow = new Date(targetDate);
+  tomorrow.setDate(targetDate.getDate() + 1);
 
   const params = new URLSearchParams({
     start_date: threeDaysAgo.toISOString().split('T')[0],
@@ -357,13 +397,13 @@ async function getOuraWakeTime(env) {
   }
 
   // Find sessions that ended today
-  const todayStr = today.toISOString().split('T')[0];
-  const todaySessions = sessions.filter(s =>
-    s.bedtime_end?.startsWith(todayStr)
+  const targetStr = (dateParam || targetDate.toISOString().split('T')[0]);
+  const targetSessions = sessions.filter(s =>
+    s.bedtime_end?.startsWith(targetStr)
   );
 
-  const latestSession = todaySessions.length > 0
-    ? todaySessions.reduce((a, b) =>
+  const latestSession = targetSessions.length > 0
+    ? targetSessions.reduce((a, b) =>
         a.bedtime_end > b.bedtime_end ? a : b)
     : sessions.reduce((a, b) =>
         a.bedtime_end > b.bedtime_end ? a : b);
@@ -496,16 +536,11 @@ async function getCalendarInfo(accessToken) {
  * @param {string} timeZone - IANA timezone name (e.g., 'America/New_York')
  * @returns {{ startStr: string, endStr: string, localDate: string }} Day boundaries
  */
-function getDayBoundariesInTimezone(timeZone) {
-  const now = new Date();
+function getDayBoundariesInTimezone(timeZone, dateParam = null) {
+  const base = dateParam ? new Date(`${dateParam}T12:00:00Z`) : new Date();
 
   // Get today's date in the target timezone (YYYY-MM-DD format)
-  const localDate = now.toLocaleDateString('en-CA', { timeZone });
-
-  // Create proper RFC3339 timestamps by parsing local midnight and converting to ISO
-  // This creates a date at midnight local time, then converts to UTC ISO string
-  const startDate = new Date(`${localDate}T00:00:00`);
-  const endDate = new Date(`${localDate}T23:59:59`);
+  const localDate = dateParam || base.toLocaleDateString('en-CA', { timeZone });
 
   // Get timezone offset for the target timezone
   const formatter = new Intl.DateTimeFormat('en-US', {
@@ -513,7 +548,7 @@ function getDayBoundariesInTimezone(timeZone) {
     hour: 'numeric',
     timeZoneName: 'shortOffset'
   });
-  const parts = formatter.formatToParts(now);
+  const parts = formatter.formatToParts(base);
   const offsetPart = parts.find(p => p.type === 'timeZoneName');
   // Convert "GMT-5" to "-05:00" format
   let offset = '+00:00';
@@ -538,13 +573,13 @@ function getDayBoundariesInTimezone(timeZone) {
  * @param {string} [timeZone='America/New_York'] - IANA timezone name
  * @returns {Promise<Array<Object>>} Array of calendar events
  */
-async function getTodaysEvents(accessToken, timeZone = 'America/New_York') {
-  const result = await getTodaysEventsRaw(accessToken, timeZone);
+async function getTodaysEvents(accessToken, timeZone = 'America/New_York', dateParam = null) {
+  const result = await getTodaysEventsRaw(accessToken, timeZone, dateParam);
   return result.items;
 }
 
-async function getTodaysEventsRaw(accessToken, timeZone = 'America/New_York') {
-  const { startStr, endStr } = getDayBoundariesInTimezone(timeZone);
+async function getTodaysEventsRaw(accessToken, timeZone = 'America/New_York', dateParam = null) {
+  const { startStr, endStr } = getDayBoundariesInTimezone(timeZone, dateParam);
 
   const params = new URLSearchParams({
     timeMin: startStr,
@@ -662,6 +697,22 @@ export function calculateShiftedTimes(event, offsetMinutes) {
 export function calculateOffset(actualWake, expectedWake) {
   const offsetMs = actualWake.getTime() - expectedWake.getTime();
   return Math.round(offsetMs / 60000);
+}
+
+/**
+ * Format a date-time string into HH:MM in a specific timezone
+ */
+function formatTimeInZone(dateTimeStr, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit'
+  }).formatToParts(new Date(dateTimeStr));
+
+  const hour = parts.find(p => p.type === 'hour')?.value || '00';
+  const minute = parts.find(p => p.type === 'minute')?.value || '00';
+  return `${hour}:${minute}`;
 }
 
 /**
